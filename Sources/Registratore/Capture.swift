@@ -80,45 +80,79 @@ final class AudioFileWriter {
     }
 }
 
-// MARK: - Microfono
+// MARK: - Microfono (AVCaptureSession: gestisce bene AirPods e dispositivi Bluetooth)
 
-final class MicrophoneCapture {
-    private let engine = AVAudioEngine()
+final class MicrophoneCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+    private let session = AVCaptureSession()
     private let writer: AudioFileWriter
-    private let deviceID: AudioDeviceID?
+    private let deviceUID: String?
+    private let queue = DispatchQueue(label: "registratore.microphone")
+    var onError: ((Error) -> Void)?
 
-    /// deviceID nil = microfono predefinito di sistema.
-    init(writer: AudioFileWriter, deviceID: AudioDeviceID? = nil) {
+    /// deviceUID nil = microfono predefinito di sistema.
+    init(writer: AudioFileWriter, deviceUID: String? = nil) {
         self.writer = writer
-        self.deviceID = deviceID
+        self.deviceUID = deviceUID
     }
 
     func start() throws {
-        let input = engine.inputNode
-        if var id = deviceID {
-            guard let unit = input.audioUnit,
-                  AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
-                                       kAudioUnitScope_Global, 0, &id,
-                                       UInt32(MemoryLayout<AudioDeviceID>.size)) == noErr
-            else { throw RecorderError.microphoneUnavailable }
+        let device: AVCaptureDevice?
+        if let uid = deviceUID {
+            device = AVCaptureDevice(uniqueID: uid)
+        } else {
+            device = AVCaptureDevice.default(for: .audio)
         }
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            throw RecorderError.noMicrophone
+        guard let device else {
+            throw deviceUID == nil ? RecorderError.noMicrophone : RecorderError.microphoneUnavailable
         }
-        let writer = self.writer
-        input.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, time in
-            guard let mono = MicrophoneCapture.mono(buffer) else { return }
-            let host = time.isHostTimeValid ? AVAudioTime.seconds(forHostTime: time.hostTime) : nil
-            writer.write(mono, hostSeconds: host)
+
+        let input = try AVCaptureDeviceInput(device: device)
+        let output = AVCaptureAudioDataOutput()
+        // Formato fisso: se il dispositivo cambia modalità (es. AirPods che passano
+        // al profilo "chiamata") il sistema converte e il file resta coerente.
+        output.audioSettings = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: 48_000,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsNonInterleaved: true
+        ]
+        output.setSampleBufferDelegate(self, queue: queue)
+
+        session.beginConfiguration()
+        guard session.canAddInput(input), session.canAddOutput(output) else {
+            session.commitConfiguration()
+            throw RecorderError.microphoneUnavailable
         }
-        engine.prepare()
-        try engine.start()
+        session.addInput(input)
+        session.addOutput(output)
+        session.commitConfiguration()
+
+        NotificationCenter.default.addObserver(self, selector: #selector(runtimeError(_:)),
+                                               name: .AVCaptureSessionRuntimeError, object: session)
+        session.startRunning()
+        guard session.isRunning else { throw RecorderError.microphoneUnavailable }
     }
 
     func stop() {
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+        NotificationCenter.default.removeObserver(self)
+        session.stopRunning()
+    }
+
+    @objc private func runtimeError(_ note: Notification) {
+        let error = note.userInfo?[AVCaptureSessionErrorKey] as? Error ?? RecorderError.microphoneUnavailable
+        onError?(error)
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
+        let writer = self.writer
+        SampleBufferAudio.withPCMBuffer(sampleBuffer) { pcm in
+            guard let mono = MicrophoneCapture.mono(pcm) else { return }
+            writer.write(mono, hostSeconds: pts.isFinite ? pts : nil)
+        }
     }
 
     /// La voce basta in mono: media dei canali in ingresso.
@@ -140,6 +174,50 @@ final class MicrophoneCapture {
         }
         out.frameLength = buffer.frameLength
         return out
+    }
+}
+
+// MARK: - Conversione CMSampleBuffer -> AVAudioPCMBuffer
+
+enum SampleBufferAudio {
+    /// Il buffer passato a body è valido solo durante la chiamata.
+    static func withPCMBuffer(_ sampleBuffer: CMSampleBuffer, _ body: (AVAudioPCMBuffer) -> Void) {
+        guard CMSampleBufferDataIsReady(sampleBuffer),
+              CMSampleBufferGetNumSamples(sampleBuffer) > 0,
+              let description = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description),
+              let format = AVAudioFormat(streamDescription: asbd) else { return }
+
+        var listSize = 0
+        _ = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: &listSize,
+            bufferListOut: nil,
+            bufferListSize: 0,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: 0,
+            blockBufferOut: nil)
+        guard listSize > 0 else { return }
+
+        let raw = UnsafeMutableRawPointer.allocate(byteCount: listSize,
+                                                   alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { raw.deallocate() }
+        let list = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
+
+        var blockBuffer: CMBlockBuffer?
+        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: list,
+            bufferListSize: listSize,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+            blockBufferOut: &blockBuffer)
+        guard status == noErr,
+              let pcm = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: list, deallocator: nil) else { return }
+        withExtendedLifetime(blockBuffer) { body(pcm) }
     }
 }
 
@@ -213,41 +291,13 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
             writer.writeSilence(seconds: min(pts - expected, 3600), format: format)
         }
 
-        var listSize = 0
-        _ = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sampleBuffer,
-            bufferListSizeNeededOut: &listSize,
-            bufferListOut: nil,
-            bufferListSize: 0,
-            blockBufferAllocator: nil,
-            blockBufferMemoryAllocator: nil,
-            flags: 0,
-            blockBufferOut: nil)
-        guard listSize > 0 else { return }
-
-        let raw = UnsafeMutableRawPointer.allocate(byteCount: listSize,
-                                                   alignment: MemoryLayout<AudioBufferList>.alignment)
-        defer { raw.deallocate() }
-        let list = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
-
-        var blockBuffer: CMBlockBuffer?
-        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sampleBuffer,
-            bufferListSizeNeededOut: nil,
-            bufferListOut: list,
-            bufferListSize: listSize,
-            blockBufferAllocator: nil,
-            blockBufferMemoryAllocator: nil,
-            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
-            blockBufferOut: &blockBuffer)
-        guard status == noErr,
-              let pcm = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: list, deallocator: nil) else { return }
-
-        writer.write(pcm, hostSeconds: pts.isFinite ? pts : nil)
+        let writer = self.writer
+        SampleBufferAudio.withPCMBuffer(sampleBuffer) { pcm in
+            writer.write(pcm, hostSeconds: pts.isFinite ? pts : nil)
+        }
         if pts.isFinite {
             nextPTS = pts + Double(frames) / format.sampleRate
         }
-        _ = blockBuffer
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {

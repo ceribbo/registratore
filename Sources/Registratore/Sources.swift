@@ -27,10 +27,6 @@ enum AudioSources {
         }
     }
 
-    static func deviceID(forUID uid: String) -> AudioDeviceID? {
-        allDeviceIDs().first { stringProperty($0, kAudioDevicePropertyDeviceUID) == uid }
-    }
-
     /// App in esecuzione con interfaccia (quelle che compaiono nel Dock).
     static func runningApps() -> [AppSource] {
         let own = Bundle.main.bundleIdentifier

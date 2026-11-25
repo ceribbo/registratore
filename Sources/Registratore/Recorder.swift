@@ -122,18 +122,18 @@ final class Recorder: ObservableObject {
         needsDictation = false
         state = .busy("Avvio...")
 
-        var micDevice: AudioDeviceID?
+        var micDevice: String?
         if useMicrophone {
             guard await AVCaptureDevice.requestAccess(for: .audio) else {
                 fail("Accesso al microfono negato. Abilitalo in Impostazioni di Sistema > Privacy e sicurezza > Microfono.")
                 return
             }
             if !microphoneUID.isEmpty {
-                guard let id = AudioSources.deviceID(forUID: microphoneUID) else {
+                guard AVCaptureDevice(uniqueID: microphoneUID) != nil else {
                     fail(RecorderError.microphoneUnavailable.localizedDescription)
                     return
                 }
-                micDevice = id
+                micDevice = microphoneUID
             }
         }
 
@@ -187,7 +187,12 @@ final class Recorder: ObservableObject {
 
         var m: MicrophoneCapture?
         if useMicrophone {
-            let capture = MicrophoneCapture(writer: micW, deviceID: micDevice)
+            let capture = MicrophoneCapture(writer: micW, deviceUID: micDevice)
+            capture.onError = { [weak self] error in
+                Task { @MainActor in
+                    self?.message = "Microfono interrotto: \(error.localizedDescription)"
+                }
+            }
             do {
                 try capture.start()
             } catch {
