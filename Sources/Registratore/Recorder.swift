@@ -56,6 +56,10 @@ final class Recorder: ObservableObject {
     @Published var microphoneUID: String {
         didSet { UserDefaults.standard.set(microphoneUID, forKey: "microphoneUID") }
     }
+    /// Elaborazione vocale di sistema sul microfono (come nelle app di videochiamata).
+    @Published var enhanceVoice: Bool {
+        didSet { UserDefaults.standard.set(enhanceVoice, forKey: "enhanceVoice") }
+    }
     @Published var useSystemAudio: Bool {
         didSet { UserDefaults.standard.set(useSystemAudio, forKey: "useSystemAudio") }
     }
@@ -82,6 +86,7 @@ final class Recorder: ObservableObject {
         language = defaults.string(forKey: "language") ?? "it-IT"
         useMicrophone = defaults.object(forKey: "useMicrophone") as? Bool ?? true
         microphoneUID = defaults.string(forKey: "microphoneUID") ?? ""
+        enhanceVoice = defaults.object(forKey: "enhanceVoice") as? Bool ?? true
         useSystemAudio = defaults.object(forKey: "useSystemAudio") as? Bool ?? true
         systemAppBundleID = defaults.string(forKey: "systemAppBundleID") ?? ""
         refreshSources()
@@ -187,7 +192,7 @@ final class Recorder: ObservableObject {
 
         var m: MicrophoneCapture?
         if useMicrophone {
-            let capture = MicrophoneCapture(writer: micW, deviceUID: micDevice)
+            let capture = MicrophoneCapture(writer: micW, deviceUID: micDevice, enhance: enhanceVoice)
             capture.onError = { [weak self] error in
                 Task { @MainActor in
                     self?.message = "Microfono interrotto: \(error.localizedDescription)"

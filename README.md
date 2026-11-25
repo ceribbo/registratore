@@ -58,11 +58,14 @@ In `Documenti/Registratore/<data ora>/` trovi:
 | `registrazione.m4a` | mix di microfono e audio del Mac |
 | `trascrizione.txt` | dialogo con orari, "Io" e "Altri" (se la trascrizione è attiva) |
 
+Prima del mix voce e call vengono portate automaticamente allo stesso volume, così la tua voce non risulta più bassa degli altri.
+
 Le tracce separate servono solo durante l'elaborazione e vengono eliminate. Restano (`voce.m4a`, `call.m4a`) solo se il mix non riesce, per non perdere l'audio.
 
 ### Fonti
 
 - **Microfono**: attivalo o disattivalo e scegli il dispositivo (predefinito, microfono del Mac, AirPods, USB, ecc.).
+- **Migliora la voce** (attivo di default): applica al microfono l'elaborazione vocale di macOS, la stessa delle app di videochiamata (volume automatico, riduzione del rumore e dell'eco). Funziona con il microfono predefinito di sistema.
 - **Audio del Mac**: attivalo o disattivalo e scegli se registrare tutte le app o solo quella della call, così notifiche e musica restano fuori.
 
 ### Lingue

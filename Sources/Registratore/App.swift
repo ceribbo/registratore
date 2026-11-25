@@ -184,6 +184,15 @@ struct SourcesView: View {
             .labelsHidden()
             .disabled(!recorder.useMicrophone)
 
+            Toggle("Migliora la voce", isOn: $recorder.enhanceVoice)
+                .disabled(!recorder.useMicrophone || !recorder.microphoneUID.isEmpty)
+                .help("Volume automatico, riduzione del rumore e dell'eco, come nelle app di videochiamata")
+            if recorder.useMicrophone && !recorder.microphoneUID.isEmpty {
+                Text("Disponibile solo con il microfono predefinito di sistema.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Toggle(isOn: $recorder.useSystemAudio) {
                 Label("Audio del Mac", systemImage: "speaker.wave.2")
             }

@@ -84,18 +84,110 @@ final class AudioFileWriter {
 
 final class MicrophoneCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private let session = AVCaptureSession()
+    private var engine: AVAudioEngine?
     private let writer: AudioFileWriter
     private let deviceUID: String?
+    private let enhance: Bool
     private let queue = DispatchQueue(label: "registratore.microphone")
+    private static let outputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000,
+                                                    channels: 1, interleaved: false)!
     var onError: ((Error) -> Void)?
 
     /// deviceUID nil = microfono predefinito di sistema.
-    init(writer: AudioFileWriter, deviceUID: String? = nil) {
+    /// enhance = elaborazione vocale di sistema (volume automatico, riduzione rumore ed eco),
+    /// la stessa delle app di videochiamata. Disponibile solo con il microfono predefinito.
+    init(writer: AudioFileWriter, deviceUID: String? = nil, enhance: Bool = false) {
         self.writer = writer
         self.deviceUID = deviceUID
+        self.enhance = enhance
     }
 
     func start() throws {
+        if enhance, deviceUID == nil {
+            do {
+                try startEnhanced()
+                return
+            } catch {
+                // Se l'elaborazione vocale non parte, registriamo comunque il segnale normale.
+                engine?.stop()
+                engine = nil
+            }
+        }
+        try startSession()
+    }
+
+    // MARK: Con elaborazione vocale (AVAudioEngine + voice processing)
+
+    private func startEnhanced() throws {
+        let engine = AVAudioEngine()
+        self.engine = engine
+        let input = engine.inputNode
+        try input.setVoiceProcessingEnabled(true)
+        // Non abbassare l'audio delle altre app (la call in cuffia) mentre registriamo.
+        input.voiceProcessingOtherAudioDuckingConfiguration =
+            AVAudioVoiceProcessingOtherAudioDuckingConfiguration(enableAdvancedDucking: false, duckingLevel: .min)
+        engine.mainMixerNode.outputVolume = 0
+        try installEnhancedTap()
+
+        NotificationCenter.default.addObserver(self, selector: #selector(engineConfigurationChanged(_:)),
+                                               name: .AVAudioEngineConfigurationChange, object: engine)
+        engine.prepare()
+        try engine.start()
+    }
+
+    /// Converte sempre in 48 kHz mono: il file resta coerente anche se il dispositivo cambia formato.
+    private func installEnhancedTap() throws {
+        guard let input = engine?.inputNode else { return }
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else { throw RecorderError.noMicrophone }
+        // Con l'elaborazione vocale il canale 0 contiene la voce elaborata.
+        guard let voiceFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: format.sampleRate,
+                                              channels: 1, interleaved: false),
+              let converter = AVAudioConverter(from: voiceFormat, to: Self.outputFormat) else {
+            throw RecorderError.noMicrophone
+        }
+        let writer = self.writer
+        input.removeTap(onBus: 0)
+        input.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, time in
+            guard let source = buffer.floatChannelData?[0],
+                  let voice = AVAudioPCMBuffer(pcmFormat: voiceFormat, frameCapacity: buffer.frameLength),
+                  let dest = voice.floatChannelData?[0] else { return }
+            memcpy(dest, source, Int(buffer.frameLength) * MemoryLayout<Float>.size)
+            voice.frameLength = buffer.frameLength
+
+            let ratio = Self.outputFormat.sampleRate / voiceFormat.sampleRate
+            let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
+            guard let out = AVAudioPCMBuffer(pcmFormat: Self.outputFormat, frameCapacity: capacity) else { return }
+            var fed = false
+            var error: NSError?
+            converter.convert(to: out, error: &error) { _, status in
+                if fed { status.pointee = .noDataNow; return nil }
+                fed = true
+                status.pointee = .haveData
+                return voice
+            }
+            guard error == nil, out.frameLength > 0 else { return }
+            let host = time.isHostTimeValid ? AVAudioTime.seconds(forHostTime: time.hostTime) : nil
+            writer.write(out, hostSeconds: host)
+        }
+    }
+
+    /// Le AirPods cambiano profilo Bluetooth quando si apre il microfono: il motore si ferma
+    /// e va riavviato con il nuovo formato.
+    @objc private func engineConfigurationChanged(_ note: Notification) {
+        guard let engine else { return }
+        do {
+            try installEnhancedTap()
+            engine.prepare()
+            try engine.start()
+        } catch {
+            onError?(error)
+        }
+    }
+
+    // MARK: Segnale diretto (AVCaptureSession)
+
+    private func startSession() throws {
         let device: AVCaptureDevice?
         if let uid = deviceUID {
             device = AVCaptureDevice(uniqueID: uid)
@@ -137,7 +229,13 @@ final class MicrophoneCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDel
 
     func stop() {
         NotificationCenter.default.removeObserver(self)
-        session.stopRunning()
+        if let engine {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+            self.engine = nil
+        } else {
+            session.stopRunning()
+        }
     }
 
     @objc private func runtimeError(_ note: Notification) {
@@ -309,9 +407,14 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 
 enum AudioMixer {
     static func mix(_ tracks: [Track], to output: URL) async throws {
+        // Porta voce e call allo stesso volume prima di unirle (lavoro pesante: fuori dal main thread).
+        let leveled: [URL] = await Task.detached(priority: .userInitiated) {
+            tracks.map { (try? Leveler.level($0.url)) ?? $0.url }
+        }.value
+
         let composition = AVMutableComposition()
-        for track in tracks {
-            let asset = AVURLAsset(url: track.url)
+        for (track, url) in zip(tracks, leveled) {
+            let asset = AVURLAsset(url: url)
             guard let source = try await asset.loadTracks(withMediaType: .audio).first,
                   let dest = composition.addMutableTrack(withMediaType: .audio,
                                                          preferredTrackID: kCMPersistentTrackID_Invalid)
@@ -333,5 +436,86 @@ enum AudioMixer {
         if export.status != .completed {
             throw export.error ?? RecorderError.export
         }
+    }
+}
+
+// MARK: - Livellamento del volume
+
+/// Normalizza una traccia a un volume di riferimento, ignorando i silenzi,
+/// con un limitatore morbido che evita la distorsione sui picchi.
+enum Leveler {
+    static let targetRMS: Float = 0.1     // circa -20 dBFS: volume del parlato
+    static let maxGain: Float = 12        // al massimo +21.6 dB, per non amplificare solo rumore
+    static let silenceRMS: Float = 0.004  // blocchi più deboli (circa -48 dBFS) = silenzio
+
+    /// Restituisce il file livellato, o l'originale se non serve intervenire.
+    static func level(_ url: URL) throws -> URL {
+        let input = try AVAudioFile(forReading: url)
+        let format = input.processingFormat
+        let chunk = AVAudioFrameCount(max(1, format.sampleRate / 10))   // blocchi da 100 ms
+        guard format.commonFormat == .pcmFormatFloat32,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunk) else { return url }
+
+        // 1) Volume medio delle sole parti con suono
+        var energy: Double = 0
+        var blocks = 0
+        while input.framePosition < input.length {
+            try input.read(into: buffer, frameCount: chunk)
+            guard buffer.frameLength > 0 else { break }
+            let rms = blockRMS(buffer)
+            if rms > silenceRMS {
+                energy += Double(rms * rms)
+                blocks += 1
+            }
+        }
+        guard blocks > 0 else { return url }
+        let active = Float((energy / Double(blocks)).squareRoot())
+        let gain = min(targetRMS / active, maxGain)
+        guard abs(gain - 1) > 0.1 else { return url }
+
+        // 2) Applica guadagno e limitatore, scrive un nuovo file
+        let out = url.deletingPathExtension().appendingPathExtension("livellato.m4a")
+        try? FileManager.default.removeItem(at: out)
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: format.sampleRate,
+            AVNumberOfChannelsKey: format.channelCount,
+            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
+        ]
+        let output = try AVAudioFile(forWriting: out, settings: settings,
+                                     commonFormat: .pcmFormatFloat32, interleaved: false)
+        input.framePosition = 0
+        while input.framePosition < input.length {
+            try input.read(into: buffer, frameCount: chunk)
+            guard buffer.frameLength > 0, let data = buffer.floatChannelData else { break }
+            let frames = Int(buffer.frameLength)
+            for ch in 0..<Int(format.channelCount) {
+                let samples = data[ch]
+                for i in 0..<frames { samples[i] = limit(samples[i] * gain) }
+            }
+            try output.write(from: buffer)
+        }
+        return out
+    }
+
+    private static func blockRMS(_ buffer: AVAudioPCMBuffer) -> Float {
+        guard let data = buffer.floatChannelData else { return 0 }
+        let frames = Int(buffer.frameLength)
+        let channels = Int(buffer.format.channelCount)
+        var sum: Float = 0
+        for ch in 0..<channels {
+            let samples = data[ch]
+            for i in 0..<frames { sum += samples[i] * samples[i] }
+        }
+        return (sum / Float(max(1, frames * channels))).squareRoot()
+    }
+
+    /// Lineare fino a 0.8, poi compressione morbida che non supera mai 1.0.
+    private static func limit(_ x: Float) -> Float {
+        let threshold: Float = 0.8
+        let magnitude = abs(x)
+        guard magnitude > threshold else { return x }
+        let compressed = threshold + (1 - threshold) * tanh((magnitude - threshold) / (1 - threshold))
+        return x < 0 ? -compressed : compressed
     }
 }
